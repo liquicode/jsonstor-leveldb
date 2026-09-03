@@ -3,6 +3,9 @@
 	"version": "0.1.0",
 	"description": "A jsonstor adapter which stores documents in a LevelDB store.",
 	"license": "MIT",
+	"engines": {
+		"node": ">=18.0.0"
+	},
 	"homepage": "http://jsonstor.liquicode.com",
 	"repository": {
 		"type": "git",
