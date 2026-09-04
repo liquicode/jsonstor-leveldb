@@ -11,7 +11,7 @@ Every test in this family lives in [`@liquicode/jsonstor-docs`](https://github.c
 
 | Engine           |            A |           B |          C |          D |         E |         F |         G |          M |           N |         Z |             Total |
 |------------------|-------------:|------------:|-----------:|-----------:|----------:|----------:|----------:|-----------:|------------:|----------:|------------------:|
-| jsonstor-leveldb | 10/0 (241ms) | 27/0 (15ms) | 7/0 (70ms) | 14/0 (4ms) | 6/0 (6ms) | 3/0 (0ms) | 6/0 (0ms) | 26/0 (7ms) | 39/0 (15ms) | 2/0 (2ms) | **140/0** (360ms) |
+| jsonstor-leveldb | 10/0 (229ms) | 27/0 (10ms) | 7/0 (60ms) | 20/0 (8ms) | 6/0 (5ms) | 3/0 (1ms) | 6/0 (0ms) | 26/0 (6ms) | 39/0 (13ms) | 2/0 (2ms) | **146/0** (334ms) |
 
 Each cell is ***passing/failing (duration)***.
 

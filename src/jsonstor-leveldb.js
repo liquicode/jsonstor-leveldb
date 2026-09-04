@@ -20,6 +20,27 @@ const TERMINATOR = String.fromCharCode( 2 );
 
 
 //---------------------------------------------------------------------
+// ***The index lives in the same store, in a range which sorts below every document key.***
+//
+// A document key begins with the padded clock, so its first byte is always a digit. An index
+// key begins with \x00, which is lower than every digit - so the document scan keeps a single
+// range bound and skips the index without knowing anything about it, and ***an existing store
+// needs no migration because no document key changes.***
+//
+// ***This is why the clock key survives.*** Keying documents by the identifier instead would
+// have bought uniqueness and spent the natural order: LevelDB's iteration order is its key
+// order, and every ordered read would then have to fetch values and sort them. The wave 2 plan
+// recorded that trade before this adapter was written. An index buys the same uniqueness and
+// spends a second write per insert instead.
+const INDEX_MARKER = String.fromCharCode( 0 );
+
+// The lowest byte a document key may begin with. Numerically the separator, and a different
+// idea: it is the floor of the document range rather than a delimiter, and it is what puts the
+// index keys underneath it.
+const DOCUMENT_KEY_FLOOR = String.fromCharCode( 1 );
+
+
+//---------------------------------------------------------------------
 // ***One open store per path, shared by every storage which names that path.***
 //
 // LevelDB takes an exclusive lock on its directory, so a second store opened on a path
@@ -80,6 +101,32 @@ module.exports = {
 
 
 		//=====================================================================
+		// The key, resolved.
+		let key_declaration = jsonstor.PrimaryKey.Resolve( Storage.Settings );
+		if ( key_declaration.Fields.length > 1 )
+		{
+			// ***Declared, not built.*** One index key holds one encoded value, so an adapter
+			// which cannot honor a composite key refuses it by name.
+			throw new Error( `This adapter does not support a composite PrimaryKey: [${key_declaration.Fields.join( ', ' )}].` );
+		}
+		if ( key_declaration.Fields.length === 0 ) { key_declaration.Fields = [ jsonstor.PrimaryKey.DEFAULT_FIELD ]; }
+
+		Storage.PrimaryKeyInfo = {
+			Fields: key_declaration.Fields,
+			// The store's own key is the clock, not the identifier, so there is no key column
+			// whose type would need declaring. The index key carries the encoded value and the
+			// document carries the true one.
+			Types: [],
+			Mutable: key_declaration.Mutable,
+			Generated: true,
+			// ***jsonstor holds this index, even though it lives in the database.*** LevelDB has
+			// no secondary indexes of its own; every entry here is written and maintained by this
+			// adapter, which is what makes RefreshIndex real work rather than a no-op.
+			IndexHostedBy: 'jsonstor',
+		};
+
+
+		//=====================================================================
 		// What the two stages did, for a storage which has no first stage.
 		//
 		// ***This adapter pushes nothing down, and that is the measurement.*** LevelDB has no
@@ -97,6 +144,26 @@ module.exports = {
 				Pushdown: null,
 				PushdownRows: Scanned,
 				Residual: ( jsongin.ShortType( Criteria ) === 'o' ) ? Criteria : {},
+				ResidualRows: Matched,
+			} );
+			return;
+		}
+
+
+		//=====================================================================
+		// What the index did.
+		//
+		// ***An index is a pushdown for an adapter with no server to push down to***, so it
+		// reports in the same pair of numbers a WHERE clause does. PushdownRows is one or zero
+		// rather than the size of the collection, and that difference is the whole assertion: an
+		// index which is never entered reports the collection and looks exactly like no index.
+		function report_lookup( Options, Criteria, Scanned, Matched )
+		{
+			jsonstor.ReportStatistics( Options, {
+				Translator: '',
+				Pushdown: Criteria,
+				PushdownRows: Scanned,
+				Residual: {},
 				ResidualRows: Matched,
 			} );
 			return;
@@ -134,13 +201,174 @@ module.exports = {
 
 
 		//---------------------------------------------------------------------
-		// The half-open key range holding exactly this collection.
+		// The half-open key range holding exactly this collection's documents.
+		//
+		// ***The floor is what excludes the index.*** Every index key sorts below it, so a scan
+		// which asks for documents never sees one and never has to filter for it.
 		function collection_range()
+		{
+			return {
+				gte: Storage.Settings.CollectionName + SEPARATOR + DOCUMENT_KEY_FLOOR,
+				lt: Storage.Settings.CollectionName + TERMINATOR,
+			};
+		}
+
+
+		//---------------------------------------------------------------------
+		// Everything this collection owns: its documents and its index.
+		function everything_range()
 		{
 			return {
 				gte: Storage.Settings.CollectionName + SEPARATOR,
 				lt: Storage.Settings.CollectionName + TERMINATOR,
 			};
+		}
+
+
+		//---------------------------------------------------------------------
+		// The half-open key range holding exactly this collection's index.
+		function index_range()
+		{
+			return {
+				gte: Storage.Settings.CollectionName + SEPARATOR + INDEX_MARKER,
+				lt: Storage.Settings.CollectionName + SEPARATOR + DOCUMENT_KEY_FLOOR,
+			};
+		}
+
+
+		//---------------------------------------------------------------------
+		// The index key filing this encoded identifier.
+		function index_key( EncodedKey )
+		{
+			return Storage.Settings.CollectionName + SEPARATOR + INDEX_MARKER + EncodedKey;
+		}
+
+
+		//---------------------------------------------------------------------
+		// ***The one key which records that a lookup can no longer be trusted.***
+		//
+		// jsongin matches `{ _id: 'x' }` against a document whose identifier is `[ 'x' ]`, by the
+		// array element rule every operator obeys - so an index filed under the array cannot
+		// answer that criteria. A collection holding one must be scanned instead.
+		//
+		// An in-memory adapter keeps this as a boolean; a store which outlives the process cannot,
+		// so it is a key. The encoded value of a real identifier is never empty - it always
+		// carries its short type and a colon - so nothing else can land here.
+		function complex_key_sentinel()
+		{
+			return Storage.Settings.CollectionName + SEPARATOR + INDEX_MARKER;
+		}
+
+
+		//---------------------------------------------------------------------
+		// The encoded identifier a document carries, or null when it carries none.
+		function document_key_of( Document )
+		{
+			return jsonstor.PrimaryKey.DocumentKey( Document, Storage.PrimaryKeyInfo.Fields );
+		}
+
+
+		//---------------------------------------------------------------------
+		// Mints an identifier for a document which arrived without one.
+		function apply_new_key( Document )
+		{
+			let field = Storage.PrimaryKeyInfo.Fields[ 0 ];
+			let value = jsongin.GetValue( Document, field );
+			if ( typeof value !== 'undefined' ) { return; }
+			jsongin.SetValue( Document, field, jsonstor.NewUniqueID() );
+			return;
+		}
+
+
+		//---------------------------------------------------------------------
+		// A value LevelDB answers, or undefined when the key is not there.
+		async function get_or_undefined( Store, Key )
+		{
+			// classic-level answers undefined for a missing key rather than throwing, but an
+			// older abstract-level threw LEVEL_NOT_FOUND and this costs nothing to survive.
+			try { return await Store.get( Key ); }
+			catch ( error )
+			{
+				if ( error && ( error.code === 'LEVEL_NOT_FOUND' ) ) { return undefined; }
+				throw error;
+			}
+		}
+
+
+		//---------------------------------------------------------------------
+		// Refuses an identifier which is already in the collection.
+		//
+		// ***One point read rather than a scan***, which is the whole reason the index is here.
+		async function require_unique( Store, EncodedKey, ExceptDocumentKey )
+		{
+			if ( EncodedKey === null ) { return; }
+			let found = await get_or_undefined( Store, index_key( EncodedKey ) );
+			if ( typeof found === 'undefined' ) { return; }
+			if ( found === ExceptDocumentKey ) { return; }
+			throw new Error( `A document with this primary key already exists: ${ EncodedKey }.` );
+		}
+
+
+		//---------------------------------------------------------------------
+		// Refuses an update or a replace which moved the identifier. See
+		// jsonx/.plans/primary-keys-and-indexes.md - refusing is the only one of the three
+		// measured behaviors which cannot mislead a caller.
+		function check_key_move( Before, After )
+		{
+			if ( Storage.PrimaryKeyInfo.Mutable ) { return; }
+			if ( Before === After ) { return; }
+			throw new Error( `The primary key [${Storage.PrimaryKeyInfo.Fields[ 0 ]}] is not mutable, and this operation would change it from [${Before}] to [${After}].` );
+		}
+
+
+		//---------------------------------------------------------------------
+		// The batch operations which file a document in the index.
+		function index_writes( Document, DocumentKey )
+		{
+			let operations = [];
+			let value = jsonstor.PrimaryKey.DocumentValue( Document, Storage.PrimaryKeyInfo.Fields );
+			if ( value === null ) { return operations; }
+			operations.push( { type: 'put', key: index_key( jsonstor.PrimaryKey.EncodeValue( value ) ), value: DocumentKey } );
+			if ( !jsonstor.PrimaryKey.IsScalar( value ) )
+			{
+				operations.push( { type: 'put', key: complex_key_sentinel(), value: '1' } );
+			}
+			return operations;
+		}
+
+
+		//---------------------------------------------------------------------
+		// ***The document a by-key criteria asks for, or null to ask the scan.***
+		//
+		// Two point reads and no iteration: the index answers the document key, and the store
+		// answers the document. A miss is only trustworthy while every identifier in the
+		// collection is a scalar, which is what the sentinel records.
+		async function find_by_index( Criteria )
+		{
+			let encoded = jsonstor.PrimaryKey.CriteriaKey( Criteria, Storage.PrimaryKeyInfo.Fields );
+			if ( encoded === null ) { return null; }
+			let store = await held_store();
+
+			// ***The sentinel is read before the index and not after a miss.***
+			// A hit is just as wrong as a miss once the collection holds a non-scalar identifier:
+			// { _id: 'x' } matches a document whose identifier is [ 'x' ] as well as the one
+			// whose identifier is 'x', so answering with the hit alone ***loses a row and reports
+			// success***. Checking only the miss was the first version of this function and it was
+			// caught by the two-document case it exists for.
+			let sentinel = await get_or_undefined( store, complex_key_sentinel() );
+			if ( typeof sentinel !== 'undefined' ) { return null; }
+
+			let document_key = await get_or_undefined( store, index_key( encoded ) );
+			if ( typeof document_key === 'undefined' ) { return { Entries: [] }; }
+			let value = await get_or_undefined( store, document_key );
+			if ( typeof value === 'undefined' )
+			{
+				// ***An index entry with no document behind it.*** Nothing this adapter writes
+				// can produce one, so it means the store was written by something else. Falling
+				// through to the scan is the answer which cannot lose a row.
+				return null;
+			}
+			return { Entries: [ { Key: document_key, Document: JSON.parse( value ) } ] };
 		}
 
 
@@ -273,8 +501,49 @@ module.exports = {
 		Storage.DropStorage = async function ( Options )
 		{
 			let store = await held_store();
-			await store.clear( collection_range() );
+			// ***Everything, so the index goes with the documents.*** Clearing only the document
+			// range would leave an index describing a collection which is no longer there, and
+			// the next insert would be refused as a duplicate of a document nobody can read.
+			await store.clear( everything_range() );
 			return true;
+		};
+
+
+		//=====================================================================
+		// RefreshIndex
+		//=====================================================================
+
+
+		// ***Rebuilds the index from a full scan, and answers how many entries it filed.***
+		//
+		// This store is this adapter's own, so nothing else writes it and the index cannot drift
+		// on its own. It is real work rather than a no-op because the index is jsonstor's rather
+		// than the database's - LevelDB has no secondary index to maintain on our behalf - and
+		// because a store written by an older version of this adapter has documents and no index
+		// at all. Calling it once brings such a store up to date.
+		Storage.RefreshIndex = async function ( Options )
+		{
+			let store = await held_store();
+			await store.clear( index_range() );
+			let entries = await read_documents();
+			let operations = [];
+			let filed = 0;
+			let seen = {};
+			for ( let index = 0; index < entries.length; index++ )
+			{
+				let value = jsonstor.PrimaryKey.DocumentValue( entries[ index ].Document, Storage.PrimaryKeyInfo.Fields );
+				if ( value === null ) { continue; }
+				let encoded = jsonstor.PrimaryKey.EncodeValue( value );
+				// ***A rebuild reports what it found rather than refusing it.*** A store may
+				// already hold a duplicate, and throwing here would leave the storage unusable
+				// with no way to look at what is wrong with it.
+				if ( seen[ encoded ] ) { continue; }
+				seen[ encoded ] = true;
+				operations = operations.concat( index_writes( entries[ index ].Document, entries[ index ].Key ) );
+				filed++;
+			}
+			if ( operations.length ) { await store.batch( operations ); }
+			return filed;
 		};
 
 
@@ -312,13 +581,15 @@ module.exports = {
 				return counted;
 			}
 
-			let entries = await read_documents();
+			let looked_up = await find_by_index( Criteria );
+			let entries = looked_up ? looked_up.Entries : await read_documents();
 			let matched = 0;
 			for ( let index = 0; index < entries.length; index++ )
 			{
 				if ( jsongin.Query( entries[ index ].Document, Criteria ) ) { matched++; }
 			}
-			report_scan( Options, Criteria, entries.length, matched );
+			if ( looked_up ) { report_lookup( Options, Criteria, entries.length, matched ); }
+			else { report_scan( Options, Criteria, entries.length, matched ); }
 			return matched;
 		};
 
@@ -334,8 +605,12 @@ module.exports = {
 			if ( jsongin.ShortType( Document ) !== 'o' ) { throw new Error( `Document must be an object.` ); }
 			let store = await held_store();
 			let document = jsongin.Clone( Document );
-			if ( typeof document._id === 'undefined' ) { document._id = jsonstor.NewUniqueID(); }
-			await store.put( new_document_key(), JSON.stringify( document ) );
+			apply_new_key( document );
+			await require_unique( store, document_key_of( document ), null );
+			let document_key = new_document_key();
+			let operations = [ { type: 'put', key: document_key, value: JSON.stringify( document ) } ];
+			operations = operations.concat( index_writes( document, document_key ) );
+			await store.batch( operations );
 			if ( Options.ReturnDocuments ) { return document; }
 			return 1;
 		};
@@ -356,8 +631,14 @@ module.exports = {
 			for ( let index = 0; index < Documents.length; index++ )
 			{
 				let document = jsongin.Clone( Documents[ index ] );
-				if ( typeof document._id === 'undefined' ) { document._id = jsonstor.NewUniqueID(); }
-				operations.push( { type: 'put', key: new_document_key(), value: JSON.stringify( document ) } );
+				apply_new_key( document );
+				// ***A duplicate stops the insert where it stands.*** The batch is not yet
+				// written, so nothing before it is written either - which is a stronger promise
+				// than the other adapters can make and comes free from batching.
+				await require_unique( store, document_key_of( document ), null );
+				let document_key = new_document_key();
+				operations.push( { type: 'put', key: document_key, value: JSON.stringify( document ) } );
+				operations = operations.concat( index_writes( document, document_key ) );
 				inserted.push( document );
 			}
 			// ***One batch rather than one write per document.*** The same shape as the round
@@ -378,6 +659,19 @@ module.exports = {
 		{
 			if ( jsongin.ShortType( Options ) !== 'o' ) { Options = {}; }
 			check_criteria( Criteria );
+			let looked_up = await find_by_index( Criteria );
+			if ( looked_up )
+			{
+				let matched = null;
+				for ( let index = 0; index < looked_up.Entries.length; index++ )
+				{
+					if ( !jsongin.Query( looked_up.Entries[ index ].Document, Criteria ) ) { continue; }
+					matched = jsongin.Project( looked_up.Entries[ index ].Document, Projection );
+					break;
+				}
+				report_lookup( Options, Criteria, looked_up.Entries.length, matched ? 1 : 0 );
+				return matched;
+			}
 			let found = await find_first( Criteria );
 			let scanned = await count_documents();
 			let document = null;
@@ -396,7 +690,8 @@ module.exports = {
 		{
 			if ( jsongin.ShortType( Options ) !== 'o' ) { Options = {}; }
 			check_criteria( Criteria );
-			let entries = await read_documents();
+			let looked_up = await find_by_index( Criteria );
+			let entries = looked_up ? looked_up.Entries : await read_documents();
 			let matches_everything = criteria_matches_everything( Criteria );
 			let documents = [];
 			for ( let index = 0; index < entries.length; index++ )
@@ -407,7 +702,8 @@ module.exports = {
 					documents.push( jsongin.Project( document, Projection ) );
 				}
 			}
-			report_scan( Options, Criteria, entries.length, documents.length );
+			if ( looked_up ) { report_lookup( Options, Criteria, entries.length, documents.length ); }
+			else { report_scan( Options, Criteria, entries.length, documents.length ); }
 			return documents;
 		};
 
@@ -421,7 +717,8 @@ module.exports = {
 		{
 			if ( jsongin.ShortType( Options ) !== 'o' ) { Options = {}; }
 			check_criteria( Criteria );
-			let entries = await read_documents();
+			let looked_up = await find_by_index( Criteria );
+			let entries = looked_up ? looked_up.Entries : await read_documents();
 			let matches_everything = criteria_matches_everything( Criteria );
 			let documents = [];
 			for ( let index = 0; index < entries.length; index++ )
@@ -434,7 +731,8 @@ module.exports = {
 			}
 			if ( Sort ) { documents = jsongin.Sort( documents, Sort ); }
 			if ( MaxCount && ( MaxCount > 0 ) && ( documents.length >= MaxCount ) ) { documents = documents.splice( 0, MaxCount ); }
-			report_scan( Options, Criteria, entries.length, documents.length );
+			if ( looked_up ) { report_lookup( Options, Criteria, entries.length, documents.length ); }
+			else { report_scan( Options, Criteria, entries.length, documents.length ); }
 			return documents;
 		};
 
@@ -459,7 +757,17 @@ module.exports = {
 				// fresh key would send it to the end of the collection, which no other adapter
 				// does and no caller asked for.
 				modified = jsongin.Update( found.Document, Updates );
-				await store.put( found.Key, JSON.stringify( modified ) );
+				let before = document_key_of( found.Document );
+				let after = document_key_of( modified );
+				check_key_move( before, after );
+				let operations = [ { type: 'put', key: found.Key, value: JSON.stringify( modified ) } ];
+				if ( before !== after )
+				{
+					await require_unique( store, after, found.Key );
+					if ( before !== null ) { operations.push( { type: 'del', key: index_key( before ) } ); }
+					operations = operations.concat( index_writes( modified, found.Key ) );
+				}
+				await store.batch( operations );
 				modified_count++;
 			}
 			if ( Options.ReturnDocuments ) { return modified; }
@@ -486,7 +794,16 @@ module.exports = {
 				let entry = entries[ index ];
 				if ( !matches_everything && !jsongin.Query( entry.Document, Criteria ) ) { continue; }
 				let document = jsongin.Update( entry.Document, Updates );
+				let before = document_key_of( entry.Document );
+				let after = document_key_of( document );
+				check_key_move( before, after );
 				operations.push( { type: 'put', key: entry.Key, value: JSON.stringify( document ) } );
+				if ( before !== after )
+				{
+					await require_unique( store, after, entry.Key );
+					if ( before !== null ) { operations.push( { type: 'del', key: index_key( before ) } ); }
+					operations = operations.concat( index_writes( document, entry.Key ) );
+				}
 				modified.push( document );
 			}
 			if ( operations.length ) { await store.batch( operations ); }
@@ -504,7 +821,6 @@ module.exports = {
 		{
 			if ( jsongin.ShortType( Options ) !== 'o' ) { Options = {}; }
 			if ( jsongin.ShortType( Document ) !== 'o' ) { throw new Error( `Document must be an object.` ); }
-			if ( jsongin.ShortType( Document._id ) === 'u' ) { throw new Error( `Document must contain an _id field.` ); }
 			let store = await held_store();
 			let found = await find_first( Criteria );
 			let modified = null;
@@ -512,7 +828,27 @@ module.exports = {
 			if ( found )
 			{
 				modified = jsongin.Clone( Document );
-				await store.put( found.Key, JSON.stringify( modified ) );
+				// ***A replacement with no primary key carries the matched document's key
+				// over.*** This adapter used to throw here, which was one of three behaviors
+				// across the family - four adapters threw, three changed the key, six kept it -
+				// and the guide's own documented example is the shape which threw.
+				let key_field = Storage.PrimaryKeyInfo.Fields[ 0 ];
+				if ( typeof jsongin.GetValue( modified, key_field ) === 'undefined' )
+				{
+					let carried = jsongin.GetValue( found.Document, key_field );
+					if ( typeof carried !== 'undefined' ) { jsongin.SetValue( modified, key_field, carried ); }
+				}
+				let before = document_key_of( found.Document );
+				let after = document_key_of( modified );
+				check_key_move( before, after );
+				let operations = [ { type: 'put', key: found.Key, value: JSON.stringify( modified ) } ];
+				if ( before !== after )
+				{
+					await require_unique( store, after, found.Key );
+					if ( before !== null ) { operations.push( { type: 'del', key: index_key( before ) } ); }
+					operations = operations.concat( index_writes( modified, found.Key ) );
+				}
+				await store.batch( operations );
 				modified_count++;
 			}
 			if ( Options.ReturnDocuments ) { return modified; }
@@ -536,7 +872,10 @@ module.exports = {
 			if ( found )
 			{
 				deleted = found.Document;
-				await store.del( found.Key );
+				let operations = [ { type: 'del', key: found.Key } ];
+				let encoded = document_key_of( found.Document );
+				if ( encoded !== null ) { operations.push( { type: 'del', key: index_key( encoded ) } ); }
+				await store.batch( operations );
 				deleted_count++;
 			}
 			if ( Options.ReturnDocuments ) { return deleted; }
@@ -563,6 +902,8 @@ module.exports = {
 				let entry = entries[ index ];
 				if ( !matches_everything && !jsongin.Query( entry.Document, Criteria ) ) { continue; }
 				operations.push( { type: 'del', key: entry.Key } );
+				let encoded = document_key_of( entry.Document );
+				if ( encoded !== null ) { operations.push( { type: 'del', key: index_key( encoded ) } ); }
 				deleted.push( entry.Document );
 			}
 			if ( operations.length ) { await store.batch( operations ); }

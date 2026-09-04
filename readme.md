@@ -38,6 +38,8 @@ jsonstor.LoadPlugin( require( '@liquicode/jsonstor-leveldb' ) );
 let storage = jsonstor.GetStorage( 'jsonstor-leveldb', {
 	Path: '...',
 	CollectionName: '...',
+	PrimaryKey: "_id",
+	PrimaryKeyMutable: false,
 } );
 ```
 
@@ -48,6 +50,8 @@ Settings
 |---|:---:|:---:|---|
 | `Path` | ***Yes*** | - | Path to the folder holding the LevelDB store. It is created if it does not exist. |
 | `CollectionName` | ***Yes*** | - | The collection this storage reads and writes. One store holds as many collections as you name. |
+| `PrimaryKey` | No | `"_id"` | The document field which is the identifier. Name the field an existing store is already keyed on to read one. |
+| `PrimaryKeyMutable` | No | `false` | Allow an update or a replacement to change the identifier. Off by default, so an operation which would move it is refused by name rather than silently discarded. |
 
 Peculiarities
 ---------------------------------------------------------------------
