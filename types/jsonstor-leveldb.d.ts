@@ -17,9 +17,9 @@ declare module '@liquicode/jsonstor-leveldb'
 		Path: string;
 		/** The collection this storage reads and writes. One store holds as many collections as you name. */
 		CollectionName: string;
-		/** The document field which is the identifier. Name the field an existing store is already keyed on to read one. Defaults to `"_id"`. */
+		/** The field which holds the identifier. Set it to the key field of an existing store. Defaults to `"_id"`. */
 		PrimaryKey?: string;
-		/** Allow an update or a replacement to change the identifier. Off by default, so an operation which would move it is refused by name rather than silently discarded. Defaults to `false`. */
+		/** Allow an update or replacement to change the identifier. When `false`, such an operation is refused. Defaults to `false`. */
 		PrimaryKeyMutable?: boolean;
 	}
 

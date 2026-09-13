@@ -50,17 +50,16 @@ Settings
 |---|:---:|:---:|---|
 | `Path` | ***Yes*** | - | Path to the folder holding the LevelDB store. It is created if it does not exist. |
 | `CollectionName` | ***Yes*** | - | The collection this storage reads and writes. One store holds as many collections as you name. |
-| `PrimaryKey` | No | `"_id"` | The document field which is the identifier. Name the field an existing store is already keyed on to read one. |
-| `PrimaryKeyMutable` | No | `false` | Allow an update or a replacement to change the identifier. Off by default, so an operation which would move it is refused by name rather than silently discarded. |
+| `PrimaryKey` | No | `"_id"` | The field which holds the identifier. Set it to the key field of an existing store. |
+| `PrimaryKeyMutable` | No | `false` | Allow an update or replacement to change the identifier. When `false`, such an operation is refused. |
 
 Peculiarities
 ---------------------------------------------------------------------
 
-- ***LevelDB has no query language, so every criteria is decided by `jsongin`.*** There is no clause to build and nothing is pre-filtered: a read walks the collection and each document is tested in this process. ***That is always the right answer and it costs the whole collection***, so a query here scales with how many documents the collection holds rather than with how many match.
-- ***One store holds many collections.*** `Path` names the store and `CollectionName` names a range of keys inside it, so several storages can share one store the way several tables share one database file. They do not see each other, and `DropStorage` empties one collection rather than the store.
-- ***LevelDB locks its folder, so one process at a time.*** A second process opening the same `Path` is refused while the first holds it. Within a process the adapter opens each `Path` once and shares it, so as many storages as you like can name the same store.
-- ***A collection reads back in the order it was written.*** Insertion order is carried by the key each document is stored under, and an update leaves a document where it was. Use `FindMany2` with a `Sort` when you need a different order.
-- ***A `CollectionName` cannot contain character 1 or character 2.*** Those two bytes mark where a collection's keys begin and end, and a name holding either could reach into a neighbouring collection.
+- ***LevelDB has no query language.*** A criteria naming one identifier, such as `{ _id: 'a' }`, reads that document directly. Any other criteria reads the whole collection and `jsongin` checks each document.
+- ***One store holds many collections.*** `Path` names the store and `CollectionName` a collection in it. Collections in one store do not see each other, and `DropStorage` empties only its own collection.
+- ***One process at a time.*** LevelDB locks the store folder, so a second process cannot open the same `Path`. Within one process, any number of storages can use the same `Path`.
+- A `CollectionName` cannot contain character 1 or character 2.
 
 Storage Interface
 ---------------------------------------------------------------------
