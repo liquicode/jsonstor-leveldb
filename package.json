@@ -1,6 +1,6 @@
 {
 	"name": "@liquicode/jsonstor-leveldb",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "A jsonstor adapter which stores documents in a LevelDB store.",
 	"license": "MIT",
 	"engines": {
@@ -50,8 +50,8 @@
 		"@liquicode/devops": "^0.1.0"
 	},
 	"dependencies": {
-		"@liquicode/jsongin": "^0.1.0",
-		"@liquicode/jsonstor": "^0.1.0",
+		"@liquicode/jsongin": "^0.2.0",
+		"@liquicode/jsonstor": "^0.2.0",
 		"classic-level": "^3.0.0"
 	}
 }
